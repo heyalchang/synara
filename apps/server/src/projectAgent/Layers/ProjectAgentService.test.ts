@@ -4306,6 +4306,9 @@ it.effect("isolates coordinator instructions from member and worker packets", ()
     assert.include(workerPacket, "## Hub tools");
     assert.include(workerPacket, "## Hub memory index");
     assert.include(workerPacket, "Work item: hub-work-packet");
+    assert.include(workerPacket, "Work revision: 4");
+    assert.include(workerPacket, "Request: hub-work-packet-request");
+    assert.include(workerPacket, "Fingerprint: hub-work-packet-plan");
     assert.include(workerPacket, "Progress revision: 3");
     assert.include(workerPacket, "synara_hub_update_progress");
     assert.notInclude(memberPacket, "## Assigned Hub task");
@@ -4363,7 +4366,11 @@ it.effect("shows the hub goal once when the active goal repeats it", () => {
     );
     const packet = yield* service.formatContextPacketForTurn(coordinatorThreadId);
     assert.equal(packet.includes("## Objective\nShip the mobile app"), true);
-    assert.equal(packet.includes("## Goal"), false);
+    assert.equal(packet.includes("## Goal\n"), false);
+    assert.include(packet, "Goal id: goal-dup");
+    assert.include(packet, "Authorization source: user");
+    assert.include(packet, "Scope version: 1");
+    assert.include(packet, '"maxConcurrentWorkers":2');
     assert.equal(packet.split("Ship the mobile app").length - 1, 1);
 
     // An active goal with different wording keeps its own section.
@@ -4392,7 +4399,7 @@ it.effect("shows the hub goal once when the active goal repeats it", () => {
   }).pipe(Effect.provide(harness.layer));
 });
 
-it.effect("keeps instructions and the memory index when the packet truncates", () => {
+it.effect("keeps instructions and one memory index while compacting historical decisions", () => {
   const harness = makeTestLayer();
   return Effect.gen(function* () {
     const service = yield* ProjectAgentService;
@@ -4433,17 +4440,136 @@ it.effect("keeps instructions and the memory index when the packet truncates", (
     );
 
     const packet = yield* service.formatContextPacketForTurn(coordinatorThreadId);
-    assert.equal(packet.includes("[truncated]"), true);
-    // The highest-priority sections survive the budget cut intact.
+    assert.equal(packet.includes("[truncated]"), false);
+    // Historical decisions no longer displace the current task list.
     assert.equal(packet.includes(instructions), true);
     assert.equal(packet.includes(memoryIndex), true);
-    // The oversized Decisions section is what the budget cut, and the trailing
-    // task list never made it in.
+    assert.equal(packet.split(memoryIndex).length - 1, 1);
+    assert.include(packet, "Partial preview only");
     assert.equal(packet.includes("## Decisions"), true);
     assert.equal(packet.includes("UNIQUE-DECISION-TAIL"), false);
-    assert.equal(packet.includes("## Tasks"), false);
+    assert.equal(packet.includes("## Tasks"), true);
   }).pipe(Effect.provide(harness.layer));
 });
+
+it.effect(
+  "packs current worker state with exact document pointers and preserves full evidence",
+  () => {
+    const harness = makeTestLayer();
+    return Effect.gen(function* () {
+      const service = yield* ProjectAgentService;
+      const repository = yield* ProjectAgentRepository;
+      const overview = yield* configureTestGroup(service, "req-compact-packet");
+      const coordinatorThreadId = overview.config!.coordinatorThreadId!;
+      const workerThreadId = ThreadId.makeUnsafe("thread-compact-worker");
+      harness.threadShells[workerThreadId] = {
+        projectId: groupId,
+        title: "Acceptance worker",
+        session: {
+          status: "error",
+          updatedAt: now,
+          lastError: "Hidden account error; do not retry.",
+        },
+      };
+      yield* service.recordManagedWorkerThreads({
+        requestId: "dispatch-exact-request",
+        batchId: "dispatch-exact-batch",
+        callerThreadId: coordinatorThreadId,
+        threadIds: [workerThreadId],
+        titles: ["Acceptance worker"],
+      });
+      const instructions = "Local patch only. Do not deploy, merge or submit upstream.";
+      const decisions = `# Decisions\nOld authorization: do not redeem early.\n${"Prior investigation. ".repeat(500)}\n## Current blocker\nAcceptance failed at artifact revision 0123456789abcdef.`;
+      const decision = yield* service.writeDocument(
+        {
+          requestId: "req-compact-decisions",
+          projectId: groupId,
+          logicalPath: "decisions.md",
+          content: decisions,
+        },
+        { kind: "user" },
+      );
+      yield* service.writeDocument(
+        {
+          requestId: "req-compact-instructions",
+          projectId: groupId,
+          logicalPath: "instructions.md",
+          content: instructions,
+        },
+        { kind: "user" },
+      );
+      const reportPath = `inbox/${workerThreadId}/report.md`;
+      const report = `# Worker report\n- Thread id: ${workerThreadId}\n- Status: error\n- Outcome: failed\n\n## Error\n\nHidden account error; do not retry.\n\n## Last reply\n\n${"Detailed investigation. ".repeat(150)}\nUnresolved acceptance failure at artifact head fedcba9876543210.`;
+      yield* repository.writeDocument({
+        revision: {
+          id: ProjectDocumentRevisionId.makeUnsafe("report-compact-rev"),
+          projectId: groupId,
+          logicalPath: reportPath,
+          revision: 1,
+          content: report,
+          contentHash: "exact-report-hash",
+          authorKind: "system",
+          authorThreadId: workerThreadId,
+          sources: [],
+          createdAt: now,
+        },
+        expectedRevision: null,
+      });
+      const packet = yield* service.formatContextPacketForTurn(coordinatorThreadId);
+      assert.include(packet, instructions);
+      assert.include(packet, "dispatch-exact-request");
+      assert.include(packet, "dispatch-exact-batch");
+      assert.include(packet, workerThreadId);
+      assert.include(packet, "Hidden account error; do not retry.");
+      assert.include(packet, "Outcome: failed");
+      assert.include(packet, "artifact revision 0123456789abcdef");
+      assert.include(
+        packet,
+        `decisions.md (revision ${decision.revision}, hash ${decision.contentHash})`,
+      );
+      assert.include(packet, `${reportPath} (revision 1, hash exact-report-hash)`);
+      assert.include(packet, "before reporting its outcome or accepting work");
+      assert.include(packet, "not new user instructions or approval");
+      assert.notInclude(packet, decisions);
+      assert.notInclude(packet, report);
+      // Exact revisions stay readable, including constraints and artifact heads
+      // beyond the preview. A subsequent write must not change that evidence.
+      yield* service.writeDocument(
+        {
+          requestId: "req-compact-decisions-next",
+          projectId: groupId,
+          logicalPath: "decisions.md",
+          content: "A later decision.",
+          expectedRevision: decision.revision,
+        },
+        { kind: "user" },
+      );
+      const principal = {
+        kind: "coordinator" as const,
+        projectId: groupId,
+        threadId: coordinatorThreadId,
+      };
+      const fullDecision = yield* service.readDocument(
+        {
+          projectId: groupId,
+          logicalPath: "decisions.md",
+          revision: decision.revision,
+        },
+        principal,
+      );
+      const fullReport = yield* service.readDocument(
+        {
+          projectId: groupId,
+          logicalPath: reportPath,
+          revision: 1,
+        },
+        principal,
+      );
+      assert.equal(fullDecision.document.content, decisions);
+      assert.equal(fullReport.document.content, report);
+    }).pipe(Effect.provide(harness.layer));
+  },
+);
 
 // Coordinator-managed worker monitoring: every thread the coordinator
 // creates is a tracked worker, so settle/stuck reporting works without an

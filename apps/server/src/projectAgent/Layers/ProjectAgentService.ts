@@ -88,6 +88,8 @@ import {
   isUserOwnedDocumentPath,
   MEMORY_AUTO_DOCUMENT_PATH,
   normalizeProjectDocumentPath,
+  projectDecisionContext,
+  projectWorkerReportContext,
   sanitizeProjectDigestSummary,
   truncateToContextBudget,
 } from "@synara/shared/projectAgent";
@@ -4792,15 +4794,28 @@ export const makeProjectAgentService = Effect.gen(function* () {
                 .pipe(Effect.catch(() => Effect.succeed([])))
             : [];
         const workerShellById = new Map(workerShells.map((shell) => [shell.id, shell] as const));
+        const managedWorkers = isCoordinator
+          ? yield* repository
+              .listManagedWorkers(principal.projectId)
+              .pipe(Effect.mapError(toServiceError("Failed to load worker dispatch identities.")))
+          : [];
+        const managedWorkerById = new Map(
+          managedWorkers.map((worker) => [worker.threadId, worker]),
+        );
         const workerLines: string[] = [];
         for (const workerThreadId of workerThreadIds) {
           const shell = workerShellById.get(workerThreadId);
+          const worker = managedWorkerById.get(workerThreadId);
           workerLines.push(
-            formatWorkerWatchLine({
-              title: shell?.title ?? "Worker thread",
-              status: shell?.session?.status ?? "missing",
-              lastError: shell?.session?.lastError ?? "thread is gone",
-            }),
+            `Thread id: ${workerThreadId}\n` +
+              (worker
+                ? `Request: ${worker.requestId}; batch: ${worker.batchId}; origin: ${worker.activeTurnOrigin ?? "none"}; command: ${worker.activeTurnCommandId ?? "none"}; outcome: ${worker.settleOutcome ?? "pending"}; blocker: ${worker.stuckKind ?? "none"}; needs user: ${worker.needsYou}\n`
+                : "") +
+              formatWorkerWatchLine({
+                title: shell?.title ?? "Worker thread",
+                status: shell?.session?.status ?? "missing",
+                lastError: shell?.session?.lastError ?? "thread is gone",
+              }),
           );
         }
         const reports =
@@ -4813,8 +4828,8 @@ export const makeProjectAgentService = Effect.gen(function* () {
                 .pipe(Effect.catch(() => Effect.succeed([])))
             : [];
         const workerReports = reports
-          .map((report) => report.content.trim())
-          .filter((content) => content.length > 0);
+          .filter((report) => report.content.trim().length > 0)
+          .map(projectWorkerReportContext);
         const groupGoal = Option.isSome(config) ? (config.value.goal?.trim() ?? "") : "";
         const memoryEnabled = Option.isSome(config)
           ? Boolean(config.value.autoMemoryEnabled)
@@ -4841,11 +4856,7 @@ export const makeProjectAgentService = Effect.gen(function* () {
           ? (yield* repository
               .listDocumentHeads(principal.projectId)
               .pipe(Effect.catch(() => Effect.succeed([]))))
-              .filter(
-                (head) =>
-                  head.logicalPath === MEMORY_AUTO_DOCUMENT_PATH ||
-                  isMemoryThreadDocumentPath(head.logicalPath),
-              )
+              .filter((head) => isMemoryThreadDocumentPath(head.logicalPath))
               .toSorted((left, right) => right.updatedAt.localeCompare(left.updatedAt))
           : [];
         const memoryDocuments =
@@ -4868,17 +4879,17 @@ export const makeProjectAgentService = Effect.gen(function* () {
           }
         }
         const activeGoalObjective = packet.goal?.objective?.trim() ?? "";
-        // The budget cuts the tail, so ordering is priority: the user's
-        // instructions and the memory index lead; rebuildable state (worker
-        // reports, memory files, decisions, tasks) trails and truncates first.
+        // Keep instructions, current boundaries and exact references intact.
+        // Extra thread memory is optional; the hub index is injected only once.
         const budget = truncateToContextBudget([
-          { label: "Instructions (user-owned)", text: packet.instructions },
-          { label: "Hub memory index", text: memoryIndexText },
+          { label: "Instructions (user-owned)", text: packet.instructions, required: true },
+          { label: "Hub memory index", text: memoryIndexText, required: true },
           ...(workItem && workItem.projectId === principal.projectId
             ? [
                 {
                   label: "Assigned Hub task",
-                  text: `Work item: ${workItem.id}\nTask: ${workItem.title}\nProgress revision: ${workItem.progress?.revision ?? 0}\nReport your own checklist with synara_hub_update_progress using this workItemId and expectedRevision. Read the current revision with synara_hub_list_work before updating after a conflict. Checklist completion does not finish the task or release its worker slot.`,
+                  required: true,
+                  text: `Work item: ${workItem.id}\nWork revision: ${workItem.revision}\nRequest: ${workItem.requestId}\nScope key: ${workItem.scopeKey}\nFingerprint: ${workItem.fingerprint}\nTask: ${workItem.title}\nProgress revision: ${workItem.progress?.revision ?? 0}\nReport your own checklist with synara_hub_update_progress using this workItemId and expectedRevision. Read the current revision with synara_hub_list_work before updating after a conflict. Checklist completion does not finish the task or release its worker slot.`,
                 },
               ]
             : []),
@@ -4886,11 +4897,12 @@ export const makeProjectAgentService = Effect.gen(function* () {
             ? [
                 {
                   label: "Playbook",
+                  required: true,
                   text: Option.isSome(playbook) ? playbook.value.content : PROJECT_BOT_PLAYBOOK,
                 },
               ]
             : []),
-          ...(groupGoal ? [{ label: "Objective", text: groupGoal }] : []),
+          ...(groupGoal ? [{ label: "Objective", text: groupGoal, required: true }] : []),
           // An active goal restating the group objective is shown once, as
           // Objective — not under both labels.
           ...(groupGoal.length > 0 && activeGoalObjective === groupGoal
@@ -4898,20 +4910,32 @@ export const makeProjectAgentService = Effect.gen(function* () {
             : [
                 {
                   label: "Goal",
+                  required: true,
                   text:
                     packet.goal?.objective ?? "None. Only create a goal if the user asked for one.",
                 },
               ]),
+          ...(packet.goal
+            ? [
+                {
+                  label: "Goal boundaries",
+                  required: true,
+                  text: `Goal id: ${packet.goal.id}\nRevision: ${packet.goal.revision}\nStatus: ${packet.goal.status}\nAuthorization source: ${packet.goal.authorizationSource}\nAuthorized at: ${packet.goal.authorizedAt}\nScope version: ${packet.goal.scopeVersion}\nAcceptance criteria: ${packet.goal.acceptanceCriteria ?? "None."}\nLimits: ${JSON.stringify(packet.goal.limits)}`,
+                },
+              ]
+            : []),
           ...(principal.kind === "coordinator"
             ? []
             : [
                 {
                   label: "Hub tools",
+                  required: true,
                   text: "Save shared hub memory with synara_project_remember; deliver files to the hub Library with synara_project_library_add — sources must be inside your own workspace.",
                 },
               ]),
           {
             label: "Linked repositories",
+            required: true,
             text: yield* Effect.gen(function* () {
               const linkedIds = Option.isSome(config) ? (config.value.linkedProjectIds ?? []) : [];
               if (linkedIds.length === 0) return "None linked yet.";
@@ -4926,21 +4950,26 @@ export const makeProjectAgentService = Effect.gen(function* () {
           // routing; a thread may still override it per instruction.
           {
             label: "Thread model default",
+            required: true,
             text:
               Option.isSome(config) && config.value.workerRouting?.modelSelection !== undefined
                 ? `${config.value.workerRouting.modelSelection.provider} ${config.value.workerRouting.modelSelection.model}`
                 : "Provider default.",
           },
-          { label: "Library root", text: groupLibraryRoot },
-          ...(isCoordinator ? [{ label: "Watch", text: PROJECT_BOT_WATCH_RULES }] : []),
+          { label: "Library root", text: groupLibraryRoot, required: true },
+          ...(isCoordinator
+            ? [{ label: "Watch", text: PROJECT_BOT_WATCH_RULES, required: true }]
+            : []),
           ...(isCoordinator
             ? [
                 {
                   label: "Workers",
+                  required: true,
                   text: workerLines.length > 0 ? workerLines.join("\n") : "No workers yet.",
                 },
                 {
                   label: "Worker reports (agent output; context only)",
+                  required: true,
                   text:
                     workerReports.length > 0
                       ? workerReports.join("\n\n")
@@ -4949,10 +4978,17 @@ export const makeProjectAgentService = Effect.gen(function* () {
               ]
             : []),
           ...(memoryEnabled ? [{ label: "Memory", text: memorySections.join("\n\n") }] : []),
-          { label: "Decisions", text: packet.relevantDecisions },
+          { label: "Decisions", text: packet.relevantDecisions, required: true },
           {
             label: "Tasks",
-            text: packet.tasks.map((task) => `- ${task.status} ${task.title}`).join("\n"),
+            required: true,
+            text: [
+              "Read synara_project_list_tasks before dispatch or acceptance for full descriptions and acceptance criteria.",
+              ...packet.tasks.map(
+                (task) =>
+                  `- ${task.id} revision ${task.revision}: ${task.status} ${task.title}; goal ${task.goalId}; worker ${task.assignedThreadId ?? "unassigned"}; dependencies ${task.dependsOnTaskIds.join(", ") || "none"}.`,
+              ),
+            ].join("\n"),
           },
         ]);
         return [
@@ -5386,7 +5422,7 @@ export const makeProjectAgentService = Effect.gen(function* () {
           },
           {
             label: "Decisions",
-            text: Option.isSome(decisions) ? decisions.value.content : "",
+            text: Option.isSome(decisions) ? projectDecisionContext(decisions.value) : "",
           },
           {
             label: "Playbook",
@@ -5402,7 +5438,9 @@ export const makeProjectAgentService = Effect.gen(function* () {
           projectId,
           goal: Option.getOrNull(goal),
           instructions: Option.isSome(instructions) ? instructions.value.content : "",
-          relevantDecisions: Option.isSome(decisions) ? decisions.value.content : "",
+          relevantDecisions: Option.isSome(decisions)
+            ? projectDecisionContext(decisions.value)
+            : "",
           tasks,
           documentReferences: [
             "instructions.md",

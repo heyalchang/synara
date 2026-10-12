@@ -2,7 +2,7 @@
 // Purpose: Path, graph, and context-budget helpers for the Project Coordinator domain.
 // Layer: Shared domain helper (schema-only contracts live in @synara/contracts)
 
-import type { ProjectTaskId } from "@synara/contracts";
+import type { ProjectDocumentRevision, ProjectTaskId } from "@synara/contracts";
 import {
   PROJECT_AGENT_CONTEXT_BUDGET_CHARS,
   PROJECT_AGENT_WORKER_INBOX_PREFIX,
@@ -178,7 +178,12 @@ export function detectProjectTaskDependencyCycle(input: {
 }
 
 export function truncateToContextBudget(
-  sections: ReadonlyArray<{ readonly label: string; readonly text: string }>,
+  sections: ReadonlyArray<{
+    readonly label: string;
+    readonly text: string;
+    /** Instructions and current identities must survive even an oversized packet. */
+    readonly required?: boolean;
+  }>,
   budget = PROJECT_AGENT_CONTEXT_BUDGET_CHARS,
 ): {
   readonly packet: string;
@@ -189,6 +194,27 @@ export function truncateToContextBudget(
   if (full.length <= budget) {
     return { packet: full, characterCount: full.length, truncated: false };
   }
+  if (sections.some((section) => section.required)) {
+    const required = sections.filter((section) => section.required);
+    const requiredLength = required
+      .map((section) => `## ${section.label}\n${section.text}`)
+      .join("\n\n").length;
+    // The budget is a soft limit for required context: silently cutting an
+    // instruction, error, or revision is worse than an explicitly oversized packet.
+    let remaining = Math.max(0, budget - requiredLength - "\n\n[truncated]".length);
+    const kept = sections.filter((section) => {
+      if (section.required) return true;
+      const length = `## ${section.label}\n${section.text}`.length + 2;
+      if (length > remaining) return false;
+      remaining -= length;
+      return true;
+    });
+    if (kept.length === sections.length) {
+      return { packet: full, characterCount: full.length, truncated: false };
+    }
+    const packet = `${kept.map((section) => `## ${section.label}\n${section.text}`).join("\n\n")}\n\n[truncated]`;
+    return { packet, characterCount: packet.length, truncated: true };
+  }
   const marker = "\n\n[truncated]";
   const keep = Math.max(0, budget - marker.length);
   const packet = `${full.slice(0, keep)}${marker}`;
@@ -197,6 +223,53 @@ export function truncateToContextBudget(
     characterCount: Math.min(packet.length, budget),
     truncated: true,
   };
+}
+
+export function projectDocumentContextReference(
+  document: Pick<ProjectDocumentRevision, "logicalPath" | "revision" | "contentHash">,
+): string {
+  return `${document.logicalPath} (revision ${document.revision}, hash ${document.contentHash})`;
+}
+
+/** A preview is navigation, never a claim that older constraints are obsolete. */
+export function projectDecisionContext(
+  document: Pick<ProjectDocumentRevision, "logicalPath" | "revision" | "contentHash" | "content">,
+): string {
+  const content = document.content.trim();
+  const reference = projectDocumentContextReference(document);
+  if (content.length <= 1_200) return `${reference}\n${content}`;
+  // Decisions are append-only prose by convention, not a structured state store.
+  // Show the last entry without trying to infer which earlier rules still apply.
+  const headings = [...content.matchAll(/^#{1,6} .+$/gm)];
+  const lastHeading = headings.at(-1);
+  const preview = lastHeading ? content.slice(lastHeading.index).slice(0, 1_200) : "";
+  return [
+    reference,
+    "Partial preview only. Read the full document with synara_project_read_document at this revision before planning, dispatching, or accepting work; earlier authorization boundaries, blockers and artifact revisions still apply.",
+    ...(preview ? [`Last entry preview:\n${preview}`] : []),
+  ].join("\n");
+}
+
+export function projectWorkerReportContext(
+  document: Pick<ProjectDocumentRevision, "logicalPath" | "revision" | "contentHash" | "content">,
+): string {
+  const reference = projectDocumentContextReference(document);
+  const content = document.content.trim();
+  if (content.length <= 1_200) return `${reference}\n${content}`;
+  // Synara's settlement report puts identity, outcome and the complete error
+  // before Last reply. Keep those intact; only shorten the free-form reply.
+  const replyHeading = "\n## Last reply\n";
+  const replyStart = content.lastIndexOf(replyHeading);
+  return [
+    reference,
+    "Partial preview only. Read the full report with synara_project_read_document at this revision before reporting its outcome or accepting work; the reply may contain blockers and exact artifact revisions.",
+    replyStart >= 0
+      ? `${content.slice(0, replyStart)}\n\nLast reply preview:\n${content
+          .slice(replyStart + replyHeading.length)
+          .trim()
+          .slice(0, 600)}`
+      : `Report preview:\n${content.slice(0, 600)}`,
+  ].join("\n");
 }
 
 export function encodeProjectAgentListCursor(input: {

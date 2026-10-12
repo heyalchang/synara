@@ -228,7 +228,8 @@ Every turn of every thread in the hub, whether the coordinator started it or you
 including threads in linked repositories, receives a context packet with:
 
 - The hub **instructions**
-- The hub **goal**, if you set one, plus the hub's decisions and open tasks
+- The hub **goal**, if you set one, with its authorization, scope and limits, plus open task identities
+- Short decisions verbatim; long decisions as a partial last-entry preview and an exact document revision/hash
 - The **MEMORY.md** index of shared hub memory
 - The list of **linked repositories** and the **Library** location
 - The hub's default thread model
@@ -239,7 +240,7 @@ Edit these in hub settings → **Memory**:
   16,000 characters). Changes apply immediately.
 - **Write memory notes**: notes the coordinator writes itself as it works. While this is on,
   per-thread memory files (listed under **Thread memory**) are also added to the packet. The
-  MEMORY.md index is sent either way.
+  MEMORY.md index is sent once either way.
 - **MEMORY.md**: choose **View** to read the coordinator's running memory.
 - **Memory files**: every saved memory note. Type in the note box (for example, "Note that
   releases go out on Tuesdays") to add one yourself. Your note is added to the MEMORY.md index
@@ -357,8 +358,16 @@ set `SYNARA_HOME`.
 ## Limits and troubleshooting
 
 - A hub runs at most 8 threads at once and starts at most 8 new threads per coordinator turn.
-- The context packet is capped at 32,000 characters. Past that, lower-priority sections (memory
-  files, decisions, tasks) truncate first. Instructions and the MEMORY.md index are always kept.
+- The context packet targets 32,000 characters. Extra thread memory is omitted first. Required
+  instructions, playbook, memory index, goal boundaries, worker errors and document/task identities
+  survive even if they alone exceed that budget. This limits each packet, not accumulated chat history.
+- Coordinator packets include worker report identities, outcomes, complete error sections and short
+  reply previews. Long decision and report bodies remain available through
+  `synara_project_read_document` at the referenced revision. Previews are incomplete context:
+  read full decisions before planning, dispatch or acceptance, and full reports before reporting
+  outcomes or accepting work. Older constraints, blockers and artifact revisions still apply.
+- A silent automation run still invokes the model. Hub event receipts deduplicate event ranges;
+  they do not compare PR/check/report snapshots for timed watches.
 - A single Library add is limited to 256 MB. The MEMORY.md index keeps the newest 256 entries.
 - Hub name: 160 characters. Goal: 8,000. Instructions: 16,000.
 - Library remotes must be `https://`, `ssh://`, or `git@host:path`.

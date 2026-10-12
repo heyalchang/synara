@@ -12,6 +12,8 @@ import {
   MEMORY_DOCUMENT_PREFIX,
   memoryThreadDocumentPath,
   normalizeProjectDocumentPath,
+  projectDecisionContext,
+  projectWorkerReportContext,
   PROJECT_CONTEXT_PREVIEW_DOCUMENTS,
   ProjectAgentPathError,
   sanitizeProjectDigestFocusTitle,
@@ -153,5 +155,120 @@ describe("truncateToContextBudget", () => {
     );
     expect(result.characterCount).toBeLessThanOrEqual(40);
     expect(result.truncated).toBe(true);
+  });
+
+  it("keeps required constraints and late identities when optional context overflows", () => {
+    const result = truncateToContextBudget(
+      [
+        { label: "Instructions", text: "Do not publish.", required: true },
+        { label: "Memory", text: "history ".repeat(100) },
+        { label: "Report", text: "failed; revision 7; head abc123", required: true },
+      ],
+      100,
+    );
+    expect(result.packet).toContain("Do not publish.");
+    expect(result.packet).toContain("failed; revision 7; head abc123");
+    expect(result.packet).not.toContain("history");
+    expect(result.characterCount).toBe(result.packet.length);
+  });
+
+  it("never silently clips required context even when it alone exceeds the budget", () => {
+    const instructions = "User instructions ".repeat(100);
+    const result = truncateToContextBudget(
+      [{ label: "Instructions", text: instructions, required: true }],
+      100,
+    );
+    expect(result.packet).toContain(instructions);
+    expect(result.characterCount).toBeGreaterThan(100);
+    expect(result.characterCount).toBe(result.packet.length);
+    expect(result.truncated).toBe(false);
+  });
+});
+
+describe("document context previews", () => {
+  const document = {
+    logicalPath: "decisions.md",
+    revision: 7,
+    contentHash: "exact-document-hash",
+  };
+
+  it("keeps short decisions verbatim and identifies their exact revision", () => {
+    const content = "Do not merge. Acceptance failed on commit abc123.";
+    const result = projectDecisionContext({ ...document, content });
+    expect(result).toContain(content);
+    expect(result).toContain("revision 7, hash exact-document-hash");
+  });
+
+  it("labels long decision previews as partial and requires the full record before acting", () => {
+    const content = `# Decisions\nDo not deploy.\n${"Old outcome. ".repeat(900)}\n## Current blocker\nAcceptance failed at head abc123.`;
+    const result = projectDecisionContext({ ...document, content });
+    expect(result).toContain("Current blocker\nAcceptance failed at head abc123.");
+    expect(result).toContain("Partial preview only");
+    expect(result).toContain("before planning, dispatching, or accepting work");
+    expect(result).toContain(
+      "earlier authorization boundaries, blockers and artifact revisions still apply",
+    );
+    expect(result.length).toBeLessThan(1_600);
+    // Unstructured documents do not pretend a clipped paragraph is a current summary.
+    expect(projectDecisionContext({ ...document, content: "history ".repeat(900) })).not.toContain(
+      "Last entry preview",
+    );
+  });
+
+  it("keeps the entire worker error and identity while abbreviating the reply", () => {
+    const error = `${"Quota exhausted. ".repeat(100)}\n## Last reply\nThis heading is part of the error.`;
+    const report = {
+      ...document,
+      logicalPath: "inbox/worker-1/report.md",
+      content: `# Worker report\n- Thread id: worker-1\n- Status: error\n- Outcome: failed\n\n## Error\n\n${error}\n\n## Last reply\n\n${"Investigation details. ".repeat(400)}\nArtifact commit: abc123`,
+    };
+    const result = projectWorkerReportContext(report);
+    expect(result).toContain(error.trim());
+    expect(result).toContain("Thread id: worker-1");
+    expect(result).toContain("Outcome: failed");
+    expect(result).toContain("inbox/worker-1/report.md (revision 7, hash exact-document-hash)");
+    expect(result).toContain("before reporting its outcome or accepting work");
+    expect(result).toContain("exact artifact revisions");
+    expect(result.length).toBeLessThan(report.content.length / 2);
+  });
+
+  it.each([1, 3])("reduces representative watch packets with %i worker reports", (workers) => {
+    const memory = "- User preference: local work only; do not publish.\n".repeat(35);
+    const decisions = {
+      ...document,
+      content: `# Decisions\n${"Historical acceptance investigation. ".repeat(270)}\n## Current\nBlocked at head 0123456789abcdef; do not merge.`,
+    };
+    const reports = Array.from({ length: workers }, (_, index) => ({
+      ...document,
+      logicalPath: `inbox/worker-${index}/report.md`,
+      content: `# Worker report\n- Thread id: worker-${index}\n- Outcome: failed\n\n## Error\n\nAccount unavailable.\n\n## Last reply\n\n${"Detailed acceptance evidence. ".repeat(110)}\nArtifact head: fedcba9876543210.`,
+    }));
+    const common = [
+      { label: "Instructions", text: "Local patch only. Do not deploy or submit upstream." },
+      { label: "Hub memory index", text: memory },
+      { label: "Playbook", text: "Standing coordinator routing and safety rules.\n".repeat(160) },
+      { label: "Workers", text: "worker-0: failed; request exact-dispatch; batch exact-batch" },
+    ];
+    const before = truncateToContextBudget([
+      ...common,
+      { label: "Worker reports", text: reports.map((report) => report.content).join("\n\n") },
+      { label: "Memory", text: `### memory/MEMORY.md\n${memory}` },
+      { label: "Decisions", text: decisions.content },
+    ]);
+    const after = truncateToContextBudget([
+      ...common,
+      { label: "Worker reports", text: reports.map(projectWorkerReportContext).join("\n\n") },
+      { label: "Decisions", text: projectDecisionContext(decisions) },
+    ]);
+    expect(before.truncated).toBe(false);
+    expect(after.truncated).toBe(false);
+    expect(after.characterCount).toBeLessThan(before.characterCount * 0.55);
+    expect(after.packet).toContain(common[0]!.text);
+    expect(after.packet).toContain("exact-dispatch; batch exact-batch");
+    expect(after.packet).toContain("Blocked at head 0123456789abcdef; do not merge.");
+    expect(after.packet.split(memory).length - 1).toBe(1);
+    console.info(
+      `Hub packet fixture (${workers} workers): ${before.characterCount} -> ${after.characterCount} characters; ${Buffer.byteLength(before.packet)} -> ${Buffer.byteLength(after.packet)} UTF-8 bytes`,
+    );
   });
 });
