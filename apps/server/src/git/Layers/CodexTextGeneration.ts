@@ -38,6 +38,7 @@ import {
 import { compareCodexCliVersions, parseCodexCliVersion } from "../../provider/codexCliVersion.ts";
 import { withoutProviderCredentialEnvironment } from "../../providerChildEnvironment.ts";
 import { TextGenerationError } from "../Errors.ts";
+import { logCodexTextUsage } from "./codexTextGenerationLedger.ts";
 import {
   CodexTextGeneration,
   type BranchNameGenerationInput,
@@ -699,6 +700,7 @@ const makeCodexTextGeneration = Effect.gen(function* () {
           const args = [
             "exec",
             "--ephemeral",
+            "--json",
             "--skip-git-repo-check",
             "-s",
             "read-only",
@@ -731,6 +733,7 @@ const makeCodexTextGeneration = Effect.gen(function* () {
               ),
             ),
           );
+          const startedAtMs = Date.now();
           const { exitCode, stdout, stderr } = yield* collectCodexChildResult({
             binaryPath: codexBinaryPath,
             child,
@@ -752,6 +755,14 @@ const makeCodexTextGeneration = Effect.gen(function* () {
                   : `Codex CLI command failed with code ${exitCode}.`),
             });
           }
+          logCodexTextUsage({
+            operation,
+            model: selectedModel,
+            stdout,
+            durationMs: Date.now() - startedAtMs,
+            providerId: isolatedConfig.selectedProviderId,
+            usesApiKeyEnv: isolatedConfig.providerEnvKeys.length > 0,
+          });
         });
 
         const request = Effect.gen(function* () {
